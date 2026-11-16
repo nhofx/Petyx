@@ -1,0 +1,133 @@
+-- NoSpread.lua
+-- Lua / Roblox executor (hookfunction required)
+-- Replaces client-side cast directions with the camera-center ray,
+-- which removes spread for aim modes computed locally.
+
+local Players    = game:GetService("Players")
+local Workspace  = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+local UIS        = game:GetService("UserInputService")
+
+local CONFIG = {
+    toggleKey   = Enum.KeyCode.X,   -- flip on/off
+    spreadScale = 0.0,              -- 0 = perfect center, 1 = untouched
+    hookRaycast = true,             -- Workspace:Raycast method hook
+    hookRayNew  = true,             -- Ray.new constructor hook
+    hookScreen  = true,             -- Camera:ScreenPointToRay hook
+    debug       = false,
+}
+
+local function log(...)
+    if CONFIG.debug then
+        print("[nospread]", ...)
+    end
+end
+
+local LP       = Players.LocalPlayer
+local Cam      = Workspace.CurrentCamera
+local enabled  = true
+local originals = {}
+
+-- Depth beyond which a cast is treated as world geometry, not a shot.
+-- Prevents overriding long-range generic casts into nonsense.
+local MAX_SHOT_DISTANCE = 2048
+
+local function centerRay()
+    local cam = Workspace.CurrentCamera
+    if not cam then return nil end
+    local vp = cam.ViewportSize
+    local ok, ray = pcall(function()
+        return cam:ScreenPointToRay(vp.X * 0.5, vp.Y * 0.5)
+    end)
+    if not ok or not ray then return nil end
+    return ray.Origin, ray.Direction
+end
+
+-- Blend the incoming direction toward the center direction.
+local function blend(origin, dir, length)
+    if not enabled or CONFIG.spreadScale >= 1.0 then
+        return dir
+    end
+    local cOrigin, cDir = centerRay()
+    if not cDir then return dir end
+    local s = CONFIG.spreadScale
+    local blended = dir:Lerp(cDir, 1 - s)
+    if blended.Magnitude < 1e-6 then
+        return dir
+    end
+    return blended.Unit
+end
+
+-- 1) Workspace:Raycast
+if CONFIG.hookRaycast and typeof(Workspace.Raycast) == "function" then
+    local ok, err = pcall(function()
+        originals.Raycast = hookfunction(Workspace.Raycast, function(self, origin, direction, params)
+            if self == Workspace and enabled then
+                local mag = direction.Magnitude
+                direction = blend(origin, direction, mag) * mag
+            end
+            return originals.Raycast(self, origin, direction, params)
+        end)
+    end)
+    if not ok then log("Raycast hook failed:", err) end
+end
+
+-- 2) Ray constructor
+if CONFIG.hookRayNew and typeof(Ray.new) == "function" then
+    local ok, err = pcall(function()
+        originals.RayNew = hookfunction(Ray.new, function(origin, direction)
+            if enabled and direction.Magnitude <= MAX_SHOT_DISTANCE then
+                direction = blend(origin, direction, direction.Magnitude) * direction.Magnitude
+            end
+            return originals.RayNew(origin, direction)
+        end)
+    end)
+    if not ok then log("Ray.new hook failed:", err) end
+end
+
+-- 3) Camera:ScreenPointToRay — catches games casting from mouse position.
+if CONFIG.hookScreen then
+    local ok, err = pcall(function()
+        originals.ScreenPointToRay = hookfunction(Camera.ScreenPointToRay, function(self, x, y, depth)
+            local ray = originals.ScreenPointToRay(self, x, y, depth)
+            if not enabled or CONFIG.spreadScale >= 1.0 then
+                return ray
+            end
+            local cam = Workspace.CurrentCamera
+            if not cam then return ray end
+            local vp = cam.ViewportSize
+            local cRay = originals.ScreenPointToRay(cam, vp.X * 0.5, vp.Y * 0.5, depth)
+            local s = CONFIG.spreadScale
+            local dir = ray.Direction:Lerp(cRay.Direction, 1 - s)
+            if dir.Magnitude > 1e-6 then
+                return Ray.new(ray.Origin, dir.Unit * ray.Direction.Magnitude)
+            end
+            return ray
+        end)
+    end)
+    if not ok then log("ScreenPointToRay hook failed:", err) end
+end
+
+-- Camera swap: re-resolve camera reference on respawn / spectate.
+local function onCameraChanged()
+    Cam = Workspace.CurrentCamera
+end
+Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(onCameraChanged)
+
+-- Toggle
+UIS.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == CONFIG.toggleKey then
+        enabled = not enabled
+        print("[nospread]", enabled and "on" or "off")
+    end
+end)
+
+-- Expose for live tuning from the console.
+getgenv().NoSpread = {
+    config = CONFIG,
+    setEnabled = function(v) enabled = v ~= false end,
+    setScale = function(v) CONFIG.spreadScale = math.clamp(tonumber(v) or 0, 0, 1) end,
+}
+
+print("[nospread] loaded — toggle:", CONFIG.toggleKey.Name, "| spread:", CONFIG.spreadScale)
